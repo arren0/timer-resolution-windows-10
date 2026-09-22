@@ -17,10 +17,13 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <avrt.h>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "avrt.lib")
 
 // ---- Undocumented NTDLL timer resolution API -------------------------
 // Same functions DPC Latency Checker / ClockRes / "Timer Resolution"
@@ -39,6 +42,8 @@ static const wchar_t* kMutexName   = L"Local\\TimerFix_SingleInstance_Mutex";
 static NOTIFYICONDATAW g_nid = {};
 static ULONG g_appliedResolution = 0; // 100ns units, what we actually set
 static bool  g_resolutionActive  = false;
+static bool  g_winmmPeriodActive = false; // timeBeginPeriod(1) held
+static HANDLE g_mmcssHandle = nullptr;    // MMCSS registration
 
 // Build a small solid-color square icon at runtime so we don't need a
 // .ico resource file or a resource compiler.
@@ -135,11 +140,44 @@ static bool ApplyFinestTimerResolution()
 
     g_appliedResolution = achieved;
     g_resolutionActive = true;
+
+    // Also hold the request through the documented winmm API. Both APIs
+    // move the same underlying interrupt interval, but some undocumented
+    // scheduler heuristics for whether other processes' Sleep() calls get
+    // to benefit from it appear to key off which API/path was used to ask
+    // - so we hold both rather than relying on NtSetTimerResolution alone.
+    UINT periodMs = (UINT)(achieved / 10000); // 100ns units -> ms
+    if (periodMs < 1) periodMs = 1;
+    if (timeBeginPeriod(periodMs) == TIMERR_NOERROR)
+        g_winmmPeriodActive = true;
+
+    // Register this thread with the Multimedia Class Scheduler Service as
+    // doing latency-sensitive work. This is the officially sanctioned way
+    // for a real-time-ish process to tell the scheduler "treat my timing
+    // requests as important" - the same category real-time audio/capture
+    // tools (which is the kind of tool DPC Latency Checker is) register
+    // under, and Microsoft's own docs note MMCSS scheduling decisions can
+    // depend on factors like foreground status.
+    DWORD taskIndex = 0;
+    g_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex);
+
     return true;
 }
 
 static void ReleaseTimerResolution()
 {
+    if (g_mmcssHandle)
+    {
+        AvRevertMmThreadCharacteristics(g_mmcssHandle);
+        g_mmcssHandle = nullptr;
+    }
+    if (g_winmmPeriodActive)
+    {
+        UINT periodMs = (UINT)(g_appliedResolution / 10000);
+        if (periodMs < 1) periodMs = 1;
+        timeEndPeriod(periodMs);
+        g_winmmPeriodActive = false;
+    }
     if (!g_resolutionActive || !pNtSetTimerResolution)
         return;
     ULONG achieved = 0;
@@ -204,9 +242,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.lpszClassName = kWindowClass;
     RegisterClassExW(&wc);
 
-    // Message-only style window: never shown, never in the taskbar.
-    HWND hwnd = CreateWindowExW(0, kWindowClass, L"TimerFix", 0,
-                                 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
+    // A real (not message-only) top-level window, kept out of the taskbar
+    // and alt-tab via WS_EX_TOOLWINDOW and never shown. Some of Windows'
+    // undocumented scheduling heuristics for timer-resolution propagation
+    // appear sensitive to whether the requesting process is a genuine
+    // window-owning application versus a pure background/message-only
+    // process, so we use a real window here rather than HWND_MESSAGE.
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"TimerFix",
+                                 WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
 
     AddTrayIcon(hwnd, ok);
 
