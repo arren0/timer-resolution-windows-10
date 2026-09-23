@@ -13,34 +13,92 @@ namespace
 {
     constexpr UINT WM_TRAYICON = WM_APP + 1;
     constexpr UINT ID_EXIT = 1001;
-    constexpr UINT TIMER_PERIOD_MS = 1;
+
+    constexpr DWORD TIMER_FLAGS =
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
 
     HWND g_hwnd = nullptr;
+    HANDLE g_timer = nullptr;
+    HANDLE g_stopEvent = nullptr;
+    HANDLE g_worker = nullptr;
+
     NOTIFYICONDATAW g_nid{};
-    bool g_timerActive = false;
 
-    bool EnableTimerResolution()
+    bool g_timerResolution = false;
+
+    // ---------------------------------------------------------------------
+    // High resolution timer worker
+    // ---------------------------------------------------------------------
+
+    DWORD WINAPI TimerWorker(LPVOID)
     {
-        if (g_timerActive)
-            return true;
+        // 1 ms system timer resolution.
+        timeBeginPeriod(1);
+        g_timerResolution = true;
 
-        if (timeBeginPeriod(TIMER_PERIOD_MS) == TIMERR_NOERROR)
+        // Relative 1 ms interval.
+        LARGE_INTEGER dueTime{};
+
+        // Negative = relative time.
+        // 1 ms = 10,000 * 100 ns.
+        dueTime.QuadPart = -10000LL;
+
+        while (true)
         {
-            g_timerActive = true;
-            return true;
+            if (WaitForSingleObject(
+                    g_stopEvent,
+                    0) == WAIT_OBJECT_0)
+            {
+                break;
+            }
+
+            // Arm high-resolution timer.
+            if (!SetWaitableTimerEx(
+                    g_timer,
+                    &dueTime,
+                    0,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    0))
+            {
+                break;
+            }
+
+            HANDLE handles[2] =
+            {
+                g_stopEvent,
+                g_timer
+            };
+
+            DWORD result = WaitForMultipleObjects(
+                2,
+                handles,
+                FALSE,
+                INFINITE
+            );
+
+            if (result == WAIT_OBJECT_0)
+                break;
+
+            if (result != WAIT_OBJECT_0 + 1)
+                break;
         }
 
-        return false;
+        CancelWaitableTimer(g_timer);
+
+        if (g_timerResolution)
+        {
+            timeEndPeriod(1);
+            g_timerResolution = false;
+        }
+
+        return 0;
     }
 
-    void DisableTimerResolution()
-    {
-        if (!g_timerActive)
-            return;
-
-        timeEndPeriod(TIMER_PERIOD_MS);
-        g_timerActive = false;
-    }
+    // ---------------------------------------------------------------------
+    // Tray
+    // ---------------------------------------------------------------------
 
     bool AddTrayIcon(HWND hwnd)
     {
@@ -57,7 +115,6 @@ namespace
 
         g_nid.uCallbackMessage = WM_TRAYICON;
 
-        // Explicitly use the Unicode resource identifier.
         g_nid.hIcon =
             LoadIconW(
                 nullptr,
@@ -98,8 +155,8 @@ namespace
             L"Exit"
         );
 
-        POINT point{};
-        GetCursorPos(&point);
+        POINT pt{};
+        GetCursorPos(&pt);
 
         SetForegroundWindow(hwnd);
 
@@ -108,8 +165,8 @@ namespace
             TPM_RIGHTBUTTON |
             TPM_BOTTOMALIGN |
             TPM_LEFTALIGN,
-            point.x,
-            point.y,
+            pt.x,
+            pt.y,
             0,
             hwnd,
             nullptr
@@ -124,6 +181,10 @@ namespace
             0
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Window
+    // ---------------------------------------------------------------------
 
     LRESULT CALLBACK WindowProc(
         HWND hwnd,
@@ -155,8 +216,21 @@ namespace
 
         case WM_DESTROY:
 
+            if (g_stopEvent)
+                SetEvent(g_stopEvent);
+
+            if (g_worker)
+            {
+                WaitForSingleObject(
+                    g_worker,
+                    INFINITE
+                );
+
+                CloseHandle(g_worker);
+                g_worker = nullptr;
+            }
+
             RemoveTrayIcon();
-            DisableTimerResolution();
 
             PostQuitMessage(0);
             return 0;
@@ -173,7 +247,7 @@ namespace
     HWND CreateHiddenWindow(HINSTANCE instance)
     {
         constexpr wchar_t CLASS_NAME[] =
-            L"TimerFixHiddenWindow";
+            L"TimerFixWindowClass";
 
         WNDCLASSEXW wc{};
 
@@ -202,17 +276,21 @@ namespace
     }
 }
 
+// -------------------------------------------------------------------------
+// Entry
+// -------------------------------------------------------------------------
+
 int WINAPI wWinMain(
     HINSTANCE hInstance,
     HINSTANCE,
     PWSTR,
     int)
 {
-    // Prevent multiple instances.
+    // Single instance.
     HANDLE mutex = CreateMutexW(
         nullptr,
         TRUE,
-        L"Global\\TimerFix_SingleInstance"
+        L"Global\\TimerFix_HighResolution"
     );
 
     if (!mutex)
@@ -224,37 +302,107 @@ int WINAPI wWinMain(
         return 0;
     }
 
+    // Stop event.
+    g_stopEvent = CreateEventW(
+        nullptr,
+        TRUE,
+        FALSE,
+        nullptr
+    );
+
+    if (!g_stopEvent)
+    {
+        CloseHandle(mutex);
+        return 1;
+    }
+
+    // High-resolution waitable timer.
+    g_timer = CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        TIMER_FLAGS,
+        TIMER_ALL_ACCESS
+    );
+
+    if (!g_timer)
+    {
+        CloseHandle(g_stopEvent);
+        CloseHandle(mutex);
+        return 1;
+    }
+
+    // Invisible message window.
     g_hwnd = CreateHiddenWindow(hInstance);
 
     if (!g_hwnd)
     {
+        CloseHandle(g_timer);
+        CloseHandle(g_stopEvent);
         CloseHandle(mutex);
         return 1;
     }
 
+    // Tray icon.
     if (!AddTrayIcon(g_hwnd))
     {
         DestroyWindow(g_hwnd);
+        CloseHandle(g_timer);
+        CloseHandle(g_stopEvent);
         CloseHandle(mutex);
         return 1;
     }
 
-    // Request 1 ms timer resolution.
-    EnableTimerResolution();
+    // Start timer worker.
+    g_worker = CreateThread(
+        nullptr,
+        0,
+        TimerWorker,
+        nullptr,
+        0,
+        nullptr
+    );
 
-    MSG message{};
+    if (!g_worker)
+    {
+        DestroyWindow(g_hwnd);
+        CloseHandle(g_timer);
+        CloseHandle(g_stopEvent);
+        CloseHandle(mutex);
+        return 1;
+    }
+
+    // Message loop.
+    MSG msg{};
 
     while (GetMessageW(
-        &message,
+        &msg,
         nullptr,
         0,
         0) > 0)
     {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
-    DisableTimerResolution();
+    // Cleanup.
+    if (g_stopEvent)
+        SetEvent(g_stopEvent);
+
+    if (g_worker)
+    {
+        WaitForSingleObject(
+            g_worker,
+            INFINITE
+        );
+
+        CloseHandle(g_worker);
+    }
+
+    if (g_timer)
+        CloseHandle(g_timer);
+
+    if (g_stopEvent)
+        CloseHandle(g_stopEvent);
 
     CloseHandle(mutex);
 
