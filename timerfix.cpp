@@ -1,410 +1,279 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+// timerfix.cpp
+//
+// Ultra-lightweight background utility for Windows 10 that fixes the
+// broken "delta timer" behavior by forcing the system timer to its
+// finest available resolution (typically 0.5ms instead of the default
+// ~15.6ms), exactly the same side effect that keeping DPC Latency
+// Checker open has. Sits in the tray as a plain colored square with a
+// single "Exit" option. No console, no dialogs, ~0% CPU, a few MB RAM.
+//
+// Build (MinGW-w64, one line, no resource compiler needed):
+//   g++ -O2 -s -static -mwindows -o TimerFix.exe timerfix.cpp -lshell32 -luser32 -lgdi32
+//
+// Build (MSVC, from a "Developer Command Prompt"):
+//   cl /O2 /EHsc timerfix.cpp /link /SUBSYSTEM:WINDOWS shell32.lib user32.lib gdi32.lib /OUT:TimerFix.exe
+//
+// Runs fine unelevated (no admin rights required). Works on Win 10 and 11.
 
 #include <windows.h>
-#include <mmsystem.h>
 #include <shellapi.h>
+#include <avrt.h>
 
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "avrt.lib")
 
-namespace
+// ---- Undocumented NTDLL timer resolution API -------------------------
+// Same functions DPC Latency Checker / ClockRes / "Timer Resolution"
+// tools use. Resolution values are in 100-nanosecond units.
+typedef LONG(NTAPI* NtSetTimerResolution_t)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+typedef LONG(NTAPI* NtQueryTimerResolution_t)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+
+static NtSetTimerResolution_t   pNtSetTimerResolution   = nullptr;
+static NtQueryTimerResolution_t pNtQueryTimerResolution  = nullptr;
+
+static const wchar_t* kWindowClass = L"TimerFixTrayWndClass";
+static const wchar_t* kMutexName   = L"Local\\TimerFix_SingleInstance_Mutex";
+#define WM_TRAYICON   (WM_APP + 1)
+#define ID_TRAY_EXIT  1001
+
+static NOTIFYICONDATAW g_nid = {};
+static ULONG g_appliedResolution = 0; // 100ns units, what we actually set
+static bool  g_resolutionActive  = false;
+static HANDLE g_mmcssHandle = nullptr;    // MMCSS registration
+static MMRESULT g_periodicTimerId = 0;    // real periodic multimedia timer
+static bool  g_execStateActive = false;   // idle/sleep prevention held
+
+// No-op callback: its only job is to make timeSetEvent a genuine,
+// continuously-firing periodic timer rather than a passive resolution
+// request, so the CPU actually wakes up every period instead of
+// potentially dropping into a deep idle state between events.
+static void CALLBACK PeriodicTimerCallback(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR)
 {
-    constexpr UINT WM_TRAYICON = WM_APP + 1;
-    constexpr UINT ID_EXIT = 1001;
-
-    constexpr DWORD TIMER_FLAGS =
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
-
-    HWND g_hwnd = nullptr;
-    HANDLE g_timer = nullptr;
-    HANDLE g_stopEvent = nullptr;
-    HANDLE g_worker = nullptr;
-
-    NOTIFYICONDATAW g_nid{};
-
-    bool g_timerResolution = false;
-
-    // ---------------------------------------------------------------------
-    // High resolution timer worker
-    // ---------------------------------------------------------------------
-
-    DWORD WINAPI TimerWorker(LPVOID)
-    {
-        // 1 ms system timer resolution.
-        timeBeginPeriod(1);
-        g_timerResolution = true;
-
-        // Relative 1 ms interval.
-        LARGE_INTEGER dueTime{};
-
-        // Negative = relative time.
-        // 1 ms = 10,000 * 100 ns.
-        dueTime.QuadPart = -10000LL;
-
-        while (true)
-        {
-            if (WaitForSingleObject(
-                    g_stopEvent,
-                    0) == WAIT_OBJECT_0)
-            {
-                break;
-            }
-
-            // Arm high-resolution timer.
-            if (!SetWaitableTimerEx(
-                    g_timer,
-                    &dueTime,
-                    0,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    0))
-            {
-                break;
-            }
-
-            HANDLE handles[2] =
-            {
-                g_stopEvent,
-                g_timer
-            };
-
-            DWORD result = WaitForMultipleObjects(
-                2,
-                handles,
-                FALSE,
-                INFINITE
-            );
-
-            if (result == WAIT_OBJECT_0)
-                break;
-
-            if (result != WAIT_OBJECT_0 + 1)
-                break;
-        }
-
-        CancelWaitableTimer(g_timer);
-
-        if (g_timerResolution)
-        {
-            timeEndPeriod(1);
-            g_timerResolution = false;
-        }
-
-        return 0;
-    }
-
-    // ---------------------------------------------------------------------
-    // Tray
-    // ---------------------------------------------------------------------
-
-    bool AddTrayIcon(HWND hwnd)
-    {
-        ZeroMemory(&g_nid, sizeof(g_nid));
-
-        g_nid.cbSize = sizeof(g_nid);
-        g_nid.hWnd = hwnd;
-        g_nid.uID = 1;
-
-        g_nid.uFlags =
-            NIF_MESSAGE |
-            NIF_ICON |
-            NIF_TIP;
-
-        g_nid.uCallbackMessage = WM_TRAYICON;
-
-        g_nid.hIcon =
-            LoadIconW(
-                nullptr,
-                MAKEINTRESOURCEW(IDI_APPLICATION)
-            );
-
-        lstrcpynW(
-            g_nid.szTip,
-            L"TimerFix",
-            ARRAYSIZE(g_nid.szTip)
-        );
-
-        return Shell_NotifyIconW(
-            NIM_ADD,
-            &g_nid
-        ) != FALSE;
-    }
-
-    void RemoveTrayIcon()
-    {
-        Shell_NotifyIconW(
-            NIM_DELETE,
-            &g_nid
-        );
-    }
-
-    void ShowTrayMenu(HWND hwnd)
-    {
-        HMENU menu = CreatePopupMenu();
-
-        if (!menu)
-            return;
-
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            ID_EXIT,
-            L"Exit"
-        );
-
-        POINT pt{};
-        GetCursorPos(&pt);
-
-        SetForegroundWindow(hwnd);
-
-        TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON |
-            TPM_BOTTOMALIGN |
-            TPM_LEFTALIGN,
-            pt.x,
-            pt.y,
-            0,
-            hwnd,
-            nullptr
-        );
-
-        DestroyMenu(menu);
-
-        PostMessageW(
-            hwnd,
-            WM_NULL,
-            0,
-            0
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // Window
-    // ---------------------------------------------------------------------
-
-    LRESULT CALLBACK WindowProc(
-        HWND hwnd,
-        UINT message,
-        WPARAM wParam,
-        LPARAM lParam)
-    {
-        switch (message)
-        {
-        case WM_TRAYICON:
-
-            if (lParam == WM_RBUTTONUP ||
-                lParam == WM_CONTEXTMENU)
-            {
-                ShowTrayMenu(hwnd);
-            }
-
-            return 0;
-
-        case WM_COMMAND:
-
-            if (LOWORD(wParam) == ID_EXIT)
-            {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-
-            break;
-
-        case WM_DESTROY:
-
-            if (g_stopEvent)
-                SetEvent(g_stopEvent);
-
-            if (g_worker)
-            {
-                WaitForSingleObject(
-                    g_worker,
-                    INFINITE
-                );
-
-                CloseHandle(g_worker);
-                g_worker = nullptr;
-            }
-
-            RemoveTrayIcon();
-
-            PostQuitMessage(0);
-            return 0;
-        }
-
-        return DefWindowProcW(
-            hwnd,
-            message,
-            wParam,
-            lParam
-        );
-    }
-
-    HWND CreateHiddenWindow(HINSTANCE instance)
-    {
-        constexpr wchar_t CLASS_NAME[] =
-            L"TimerFixWindowClass";
-
-        WNDCLASSEXW wc{};
-
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = WindowProc;
-        wc.hInstance = instance;
-        wc.lpszClassName = CLASS_NAME;
-
-        if (!RegisterClassExW(&wc))
-            return nullptr;
-
-        return CreateWindowExW(
-            0,
-            CLASS_NAME,
-            L"TimerFix",
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            nullptr,
-            instance,
-            nullptr
-        );
-    }
+    // Intentionally empty.
 }
 
-// -------------------------------------------------------------------------
-// Entry
-// -------------------------------------------------------------------------
-
-int WINAPI wWinMain(
-    HINSTANCE hInstance,
-    HINSTANCE,
-    PWSTR,
-    int)
+// Build a small solid-color square icon at runtime so we don't need a
+// .ico resource file or a resource compiler.
+static HICON CreateSquareIcon(COLORREF fill, int size = 16)
 {
-    // Single instance.
-    HANDLE mutex = CreateMutexW(
-        nullptr,
-        TRUE,
-        L"Global\\TimerFix_HighResolution"
-    );
+    HDC screenDC = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(screenDC);
 
-    if (!mutex)
-        return 1;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = size;
+    bmi.bmiHeader.biHeight = -size; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, color);
+
+    RECT r = { 0, 0, size, size };
+    HBRUSH brush = CreateSolidBrush(fill);
+    FillRect(memDC, &r, brush);
+    DeleteObject(brush);
+
+    // small border so it reads clearly at tray size
+    HBRUSH border = CreateSolidBrush(RGB(20, 20, 20));
+    FrameRect(memDC, &r, border);
+    DeleteObject(border);
+
+    SelectObject(memDC, oldBmp);
+
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr); // fully opaque mask
+
+    ICONINFO ii = {};
+    ii.fIcon = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
+
+    HICON icon = CreateIconIndirect(&ii);
+
+    DeleteObject(color);
+    DeleteObject(mask);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+
+    return icon;
+}
+
+static void AddTrayIcon(HWND hwnd, bool active)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = CreateSquareIcon(active ? RGB(60, 200, 90) : RGB(200, 60, 60));
+
+    wchar_t tip[128];
+    if (active && g_appliedResolution > 0) {
+        double ms = g_appliedResolution / 10000.0;
+        wsprintfW(tip, L"Timer Resolution Fix - active (%.2f ms)", ms);
+    } else {
+        lstrcpyW(tip, L"Timer Resolution Fix - inactive");
+    }
+    lstrcpyW(g_nid.szTip, tip);
+
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+static void RemoveTrayIcon()
+{
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_nid.hIcon) DestroyIcon(g_nid.hIcon);
+}
+
+static bool ApplyFinestTimerResolution()
+{
+    if (!pNtSetTimerResolution || !pNtQueryTimerResolution)
+        return false;
+
+    ULONG minRes = 0, maxRes = 0, curRes = 0; // 100ns units
+    // Note: "MaximumResolution" is the SMALLEST number = the FINEST
+    // (highest precision) timer interval the system supports.
+    if (pNtQueryTimerResolution(&minRes, &maxRes, &curRes) != 0)
+        return false;
+
+    ULONG desired = maxRes; // finest available, typically 5000 (0.5ms)
+    ULONG achieved = 0;
+    LONG status = pNtSetTimerResolution(desired, TRUE, &achieved);
+    if (status != 0)
+        return false;
+
+    g_appliedResolution = achieved;
+    g_resolutionActive = true;
+
+    // Prevent the system from entering any idle/sleep power state while
+    // we're running - a hard requirement for what DPC Latency Checker
+    // itself needs to do to measure meaningfully, and plausibly tied to
+    // why non-participating processes see coarse Sleep() behavior only
+    // when nothing is holding the system "awake".
+    if (SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0)
+        g_execStateActive = true;
+
+    // A genuine, continuously-firing periodic timer (not just a passive
+    // resolution request) so the CPU actually wakes on schedule every
+    // period, driving real interrupt activity at the requested rate.
+    UINT periodMs = (UINT)(achieved / 10000);
+    if (periodMs < 1) periodMs = 1;
+    g_periodicTimerId = timeSetEvent(periodMs, 0, PeriodicTimerCallback, 0,
+                                      TIME_PERIODIC | TIME_KILL_SYNCHRONOUS);
+
+    // Register this thread with the Multimedia Class Scheduler Service as
+    // doing latency-sensitive work.
+    DWORD taskIndex = 0;
+    g_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex);
+
+    return true;
+}
+
+static void ReleaseTimerResolution()
+{
+    if (g_mmcssHandle)
     {
-        CloseHandle(mutex);
+        AvRevertMmThreadCharacteristics(g_mmcssHandle);
+        g_mmcssHandle = nullptr;
+    }
+    if (g_periodicTimerId)
+    {
+        timeKillEvent(g_periodicTimerId);
+        g_periodicTimerId = 0;
+    }
+    if (g_execStateActive)
+    {
+        SetThreadExecutionState(ES_CONTINUOUS); // release, allow idle again
+        g_execStateActive = false;
+    }
+    if (!g_resolutionActive || !pNtSetTimerResolution)
+        return;
+    ULONG achieved = 0;
+    pNtSetTimerResolution(g_appliedResolution, FALSE, &achieved);
+    g_resolutionActive = false;
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP)
+        {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
+            SetForegroundWindow(hwnd); // required so the menu closes properly
+            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+        }
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_TRAY_EXIT)
+        {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+
+    case WM_DESTROY:
+        ReleaseTimerResolution();
+        RemoveTrayIcon();
+        PostQuitMessage(0);
         return 0;
     }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
 
-    // Stop event.
-    g_stopEvent = CreateEventW(
-        nullptr,
-        TRUE,
-        FALSE,
-        nullptr
-    );
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
+{
+    // Single instance only.
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;
 
-    if (!g_stopEvent)
+    // Resolve the undocumented ntdll entry points.
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll)
     {
-        CloseHandle(mutex);
-        return 1;
+        pNtSetTimerResolution = (NtSetTimerResolution_t)GetProcAddress(ntdll, "NtSetTimerResolution");
+        pNtQueryTimerResolution = (NtQueryTimerResolution_t)GetProcAddress(ntdll, "NtQueryTimerResolution");
     }
 
-    // High-resolution waitable timer.
-    g_timer = CreateWaitableTimerExW(
-        nullptr,
-        nullptr,
-        TIMER_FLAGS,
-        TIMER_ALL_ACCESS
-    );
+    bool ok = ApplyFinestTimerResolution();
 
-    if (!g_timer)
-    {
-        CloseHandle(g_stopEvent);
-        CloseHandle(mutex);
-        return 1;
-    }
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = kWindowClass;
+    RegisterClassExW(&wc);
 
-    // Invisible message window.
-    g_hwnd = CreateHiddenWindow(hInstance);
+    // A real (not message-only) top-level window, kept out of the taskbar
+    // and alt-tab via WS_EX_TOOLWINDOW and never shown. Some of Windows'
+    // undocumented scheduling heuristics for timer-resolution propagation
+    // appear sensitive to whether the requesting process is a genuine
+    // window-owning application versus a pure background/message-only
+    // process, so we use a real window here rather than HWND_MESSAGE.
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"TimerFix",
+                                 WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
 
-    if (!g_hwnd)
-    {
-        CloseHandle(g_timer);
-        CloseHandle(g_stopEvent);
-        CloseHandle(mutex);
-        return 1;
-    }
+    AddTrayIcon(hwnd, ok);
 
-    // Tray icon.
-    if (!AddTrayIcon(g_hwnd))
-    {
-        DestroyWindow(g_hwnd);
-        CloseHandle(g_timer);
-        CloseHandle(g_stopEvent);
-        CloseHandle(mutex);
-        return 1;
-    }
-
-    // Start timer worker.
-    g_worker = CreateThread(
-        nullptr,
-        0,
-        TimerWorker,
-        nullptr,
-        0,
-        nullptr
-    );
-
-    if (!g_worker)
-    {
-        DestroyWindow(g_hwnd);
-        CloseHandle(g_timer);
-        CloseHandle(g_stopEvent);
-        CloseHandle(mutex);
-        return 1;
-    }
-
-    // Message loop.
-    MSG msg{};
-
-    while (GetMessageW(
-        &msg,
-        nullptr,
-        0,
-        0) > 0)
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0))
     {
         TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        DispatchMessage(&msg);
     }
 
-    // Cleanup.
-    if (g_stopEvent)
-        SetEvent(g_stopEvent);
-
-    if (g_worker)
-    {
-        WaitForSingleObject(
-            g_worker,
-            INFINITE
-        );
-
-        CloseHandle(g_worker);
-    }
-
-    if (g_timer)
-        CloseHandle(g_timer);
-
-    if (g_stopEvent)
-        CloseHandle(g_stopEvent);
-
-    CloseHandle(mutex);
-
-    return 0;
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
+    return (int)msg.wParam;
 }
