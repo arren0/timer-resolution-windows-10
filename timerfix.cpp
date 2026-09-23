@@ -1,20 +1,45 @@
+#define _WIN32_WINNT 0x0602
 #include <windows.h>
 #include <shellapi.h>
-#include <mmsystem.h>
  
-#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "shell32.lib")
+ 
+// Flag indispensabile per scavalcare il risparmio energetico di Windows 10 2004+ in user-mode
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
  
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_EXIT 1001
  
 typedef LONG(NTAPI* NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
 ULONG currentRes;
-MMRESULT timerID = 0;
+HANDLE hWaitTimer = NULL;
+bool keepRunning = true;
  
-void CALLBACK DummyTimerProc(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2) {
-    // Callback vuoto: serve solo a forzare l'OS ad abbassare il timer delta globale
+// Thread ad altissima priorità che costringe il Kernel globale a tenere il delta basso
+DWORD WINAPI ForceGlobalDeltaThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+ 
+    hWaitTimer = CreateWaitableTimerEx(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!hWaitTimer) return 0;
+ 
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart = -5000; // 0.5 ms
+    // Costringe l'OS a interrompere ogni 1ms con timer ad alta risoluzione
+    SetWaitableTimer(hWaitTimer, &dueTime, 1, NULL, NULL, FALSE);
+ 
+    while (keepRunning) {
+        if (WaitForSingleObject(hWaitTimer, INFINITE) != WAIT_OBJECT_0) break;
+    }
+ 
+    CloseHandle(hWaitTimer);
+    return 0;
 }
  
+// Disegna un quadrato rosso 16x16 in RAM
 HICON CreateRedSquareIcon() {
     ICONINFO ii = { 0 };
     ii.fIcon = TRUE;
@@ -47,17 +72,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetForegroundWindow(hwnd);
             int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
             DestroyMenu(hMenu);
-            if (cmd == ID_EXIT) {
-                PostMessage(hwnd, WM_CLOSE, 0, 0);
-            }
+            if (cmd == ID_EXIT) PostMessage(hwnd, WM_CLOSE, 0, 0);
         }
     } else if (msg == WM_DESTROY) {
+        keepRunning = false;
+        if (hWaitTimer) CancelWaitableTimer(hWaitTimer);
+ 
         NOTIFYICONDATA nid = { sizeof(nid), hwnd, 1 };
         Shell_NotifyIcon(NIM_DELETE, &nid);
- 
-        // Pulizia timer
-        if (timerID) timeKillEvent(timerID);
-        timeEndPeriod(1);
  
         HMODULE hNtdll = GetModuleHandle("ntdll.dll");
         if (hNtdll) {
@@ -72,26 +94,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
  
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
+    // 1. Richiesta Risoluzione
     HMODULE hNtdll = GetModuleHandle("ntdll.dll");
     if (hNtdll) {
         NtSetTimerResolution pNtSetTimerResolution = (NtSetTimerResolution)GetProcAddress(hNtdll, "NtSetTimerResolution");
-        if (pNtSetTimerResolution) pNtSetTimerResolution(5000, TRUE, &currentRes);
+        if (pNtSetTimerResolution) pNtSetTimerResolution(5000, TRUE, &currentRes); // 0.5ms
     }
  
-    // Forza il timer delta globale attivando un timer multimediale continuo
-    timeBeginPeriod(1);
-    timerID = timeSetEvent(1, 1, DummyTimerProc, 0, TIME_PERIODIC);
+    // 2. Forza applicazione globale del delta
+    CreateThread(NULL, 0, ForceGlobalDeltaThread, NULL, 0, NULL);
  
+    // 3. Setup Finestra Invisibile e Icona Tray
     WNDCLASS wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.lpszClassName = "TimerFixWnd";
+    wc.lpszClassName = "GlobalDeltaFix";
     RegisterClass(&wc);
-    HWND hwnd = CreateWindow("TimerFixWnd", NULL, 0, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
+    HWND hwnd = CreateWindow("GlobalDeltaFix", NULL, 0, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
  
     NOTIFYICONDATA nid = { sizeof(nid), hwnd, 1, NIF_ICON | NIF_MESSAGE | NIF_TIP, WM_TRAYICON };
     nid.hIcon = CreateRedSquareIcon();
-    lstrcpy(nid.szTip, "Timer Delta Fix (Active)");
+    lstrcpy(nid.szTip, "Timer Delta Fix (0.5ms)");
     Shell_NotifyIcon(NIM_ADD, &nid);
     DestroyIcon(nid.hIcon);
  
