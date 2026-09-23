@@ -1,265 +1,575 @@
-// timerfix.cpp
-//
-// Ultra-lightweight background utility for Windows 10 that fixes the
-// broken "delta timer" behavior by forcing the system timer to its
-// finest available resolution (typically 0.5ms instead of the default
-// ~15.6ms), exactly the same side effect that keeping DPC Latency
-// Checker open has. Sits in the tray as a plain colored square with a
-// single "Exit" option. No console, no dialogs, ~0% CPU, a few MB RAM.
-//
-// Build (MinGW-w64, one line, no resource compiler needed):
-//   g++ -O2 -s -static -mwindows -o TimerFix.exe timerfix.cpp -lshell32 -luser32 -lgdi32
-//
-// Build (MSVC, from a "Developer Command Prompt"):
-//   cl /O2 /EHsc timerfix.cpp /link /SUBSYSTEM:WINDOWS shell32.lib user32.lib gdi32.lib /OUT:TimerFix.exe
-//
-// Runs fine unelevated (no admin rights required). Works on Win 10 and 11.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <windows.h>
+#include <mmsystem.h>
 #include <shellapi.h>
-#include <avrt.h>
 
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
-// ---- Undocumented NTDLL timer resolution API -------------------------
-// Same functions DPC Latency Checker / ClockRes / "Timer Resolution"
-// tools use. Resolution values are in 100-nanosecond units.
-typedef LONG(NTAPI* NtSetTimerResolution_t)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
-typedef LONG(NTAPI* NtQueryTimerResolution_t)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+// ------------------------------------------------------------
+// Configurazione
+// ------------------------------------------------------------
 
-static NtSetTimerResolution_t   pNtSetTimerResolution   = nullptr;
-static NtQueryTimerResolution_t pNtQueryTimerResolution  = nullptr;
+static constexpr UINT TIMER_RESOLUTION_MS = 1;
 
-static const wchar_t* kWindowClass = L"TimerFixTrayWndClass";
-static const wchar_t* kMutexName   = L"Local\\TimerFix_SingleInstance_Mutex";
-#define WM_TRAYICON   (WM_APP + 1)
-#define ID_TRAY_EXIT  1001
+// Intervallo del wake-up.
+// 1 ms = comportamento più aggressivo.
+// 2-4 ms = molto più leggero.
+// 1 ms è quello da provare se il problema è proprio il delta.
+static constexpr LONG PERIOD_MS = 1;
 
-static NOTIFYICONDATAW g_nid = {};
-static ULONG g_appliedResolution = 0; // 100ns units, what we actually set
-static bool  g_resolutionActive  = false;
-static bool  g_winmmPeriodActive = false; // timeBeginPeriod(1) held
-static HANDLE g_mmcssHandle = nullptr;    // MMCSS registration
+static constexpr UINT WM_TRAYICON = WM_APP + 1;
 
-// Build a small solid-color square icon at runtime so we don't need a
-// .ico resource file or a resource compiler.
-static HICON CreateSquareIcon(COLORREF fill, int size = 16)
+static constexpr UINT ID_EXIT = 1001;
+static constexpr UINT ID_ENABLE = 1002;
+
+// ------------------------------------------------------------
+// Stato globale
+// ------------------------------------------------------------
+
+static HWND      g_hwnd = nullptr;
+static HANDLE    g_timer = nullptr;
+static HANDLE    g_thread = nullptr;
+static HICON     g_icon = nullptr;
+
+static volatile LONG g_running = 1;
+static volatile LONG g_enabled = 1;
+
+static NOTIFYICONDATAW g_nid{};
+
+// ------------------------------------------------------------
+// Timer resolution
+// ------------------------------------------------------------
+
+static bool EnableTimerResolution()
 {
-    HDC screenDC = GetDC(nullptr);
-    HDC memDC = CreateCompatibleDC(screenDC);
-
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = size;
-    bmi.bmiHeader.biHeight = -size; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP color = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, color);
-
-    RECT r = { 0, 0, size, size };
-    HBRUSH brush = CreateSolidBrush(fill);
-    FillRect(memDC, &r, brush);
-    DeleteObject(brush);
-
-    // small border so it reads clearly at tray size
-    HBRUSH border = CreateSolidBrush(RGB(20, 20, 20));
-    FrameRect(memDC, &r, border);
-    DeleteObject(border);
-
-    SelectObject(memDC, oldBmp);
-
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr); // fully opaque mask
-
-    ICONINFO ii = {};
-    ii.fIcon = TRUE;
-    ii.hbmColor = color;
-    ii.hbmMask = mask;
-
-    HICON icon = CreateIconIndirect(&ii);
-
-    DeleteObject(color);
-    DeleteObject(mask);
-    DeleteDC(memDC);
-    ReleaseDC(nullptr, screenDC);
-
-    return icon;
+    return timeBeginPeriod(TIMER_RESOLUTION_MS) == TIMERR_NOERROR;
 }
 
-static void AddTrayIcon(HWND hwnd, bool active)
+static void DisableTimerResolution()
+{
+    timeEndPeriod(TIMER_RESOLUTION_MS);
+}
+
+// ------------------------------------------------------------
+// High resolution timer
+// ------------------------------------------------------------
+
+static bool CreateHighResolutionTimer()
+{
+    // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION è disponibile
+    // nelle versioni moderne di Windows 10.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+    g_timer = CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS
+    );
+
+    if (!g_timer)
+    {
+        // Fallback a waitable timer normale.
+        g_timer = CreateWaitableTimerW(
+            nullptr,
+            FALSE,
+            nullptr
+        );
+    }
+
+    return g_timer != nullptr;
+}
+
+// ------------------------------------------------------------
+// Thread timer
+// ------------------------------------------------------------
+
+static DWORD WINAPI TimerThread(LPVOID)
+{
+    // Priorità leggermente sopra il normale.
+    // Non usiamo REALTIME_PRIORITY_CLASS.
+    SetThreadPriority(
+        GetCurrentThread(),
+        THREAD_PRIORITY_ABOVE_NORMAL
+    );
+
+    LARGE_INTEGER dueTime{};
+
+    // Primo evento tra PERIOD_MS.
+    //
+    // FILETIME/NT timeout:
+    // negativo = relativo
+    // unità = 100 ns
+    dueTime.QuadPart =
+        -static_cast<LONGLONG>(PERIOD_MS) * 10000LL;
+
+    if (!SetWaitableTimer(
+        g_timer,
+        &dueTime,
+        PERIOD_MS,
+        nullptr,
+        nullptr,
+        FALSE))
+    {
+        return 0;
+    }
+
+    while (InterlockedCompareExchange(
+        &g_running,
+        1,
+        1) != 0)
+    {
+        if (InterlockedCompareExchange(
+            &g_enabled,
+            1,
+            1) == 0)
+        {
+            Sleep(50);
+            continue;
+        }
+
+        DWORD result = WaitForSingleObject(
+            g_timer,
+            INFINITE
+        );
+
+        if (result != WAIT_OBJECT_0)
+            break;
+
+        // ----------------------------------------------------
+        // Wake-up intenzionalmente vuoto.
+        //
+        // Lo scopo non è fare lavoro:
+        // vogliamo solamente mantenere una sorgente
+        // periodica di timer ad alta risoluzione.
+        // ----------------------------------------------------
+
+        YieldProcessor();
+    }
+
+    CancelWaitableTimer(g_timer);
+
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Tray icon
+// ------------------------------------------------------------
+
+static void UpdateTrayTooltip()
+{
+    if (!g_hwnd)
+        return;
+
+    if (InterlockedCompareExchange(
+        &g_enabled,
+        1,
+        1) != 0)
+    {
+        wcscpy_s(
+            g_nid.szTip,
+            L"TimerFix - ON"
+        );
+    }
+    else
+    {
+        wcscpy_s(
+            g_nid.szTip,
+            L"TimerFix - OFF"
+        );
+    }
+
+    Shell_NotifyIconW(
+        NIM_MODIFY,
+        &g_nid
+    );
+}
+
+static void AddTrayIcon(HWND hwnd)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+
+    g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+
+    g_nid.uFlags =
+        NIF_MESSAGE |
+        NIF_ICON |
+        NIF_TIP;
+
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = CreateSquareIcon(active ? RGB(60, 200, 90) : RGB(200, 60, 60));
 
-    wchar_t tip[128];
-    if (active && g_appliedResolution > 0) {
-        double ms = g_appliedResolution / 10000.0;
-        wsprintfW(tip, L"Timer Resolution Fix - active (%.2f ms)", ms);
-    } else {
-        lstrcpyW(tip, L"Timer Resolution Fix - inactive");
-    }
-    lstrcpyW(g_nid.szTip, tip);
+    g_nid.hIcon = g_icon;
 
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    wcscpy_s(
+        g_nid.szTip,
+        L"TimerFix - ON"
+    );
+
+    Shell_NotifyIconW(
+        NIM_ADD,
+        &g_nid
+    );
+
+    // Windows moderno può richiedere versione 4.
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+
+    Shell_NotifyIconW(
+        NIM_SETVERSION,
+        &g_nid
+    );
 }
 
 static void RemoveTrayIcon()
 {
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
-    if (g_nid.hIcon) DestroyIcon(g_nid.hIcon);
+    Shell_NotifyIconW(
+        NIM_DELETE,
+        &g_nid
+    );
 }
 
-static bool ApplyFinestTimerResolution()
+// ------------------------------------------------------------
+// Menu tray
+// ------------------------------------------------------------
+
+static void ShowTrayMenu(HWND hwnd)
 {
-    if (!pNtSetTimerResolution || !pNtQueryTimerResolution)
-        return false;
+    HMENU menu = CreatePopupMenu();
 
-    ULONG minRes = 0, maxRes = 0, curRes = 0; // 100ns units
-    // Note: "MaximumResolution" is the SMALLEST number = the FINEST
-    // (highest precision) timer interval the system supports.
-    if (pNtQueryTimerResolution(&minRes, &maxRes, &curRes) != 0)
-        return false;
-
-    ULONG desired = maxRes; // finest available, typically 5000 (0.5ms)
-    ULONG achieved = 0;
-    LONG status = pNtSetTimerResolution(desired, TRUE, &achieved);
-    if (status != 0)
-        return false;
-
-    g_appliedResolution = achieved;
-    g_resolutionActive = true;
-
-    // Also hold the request through the documented winmm API. Both APIs
-    // move the same underlying interrupt interval, but some undocumented
-    // scheduler heuristics for whether other processes' Sleep() calls get
-    // to benefit from it appear to key off which API/path was used to ask
-    // - so we hold both rather than relying on NtSetTimerResolution alone.
-    UINT periodMs = (UINT)(achieved / 10000); // 100ns units -> ms
-    if (periodMs < 1) periodMs = 1;
-    if (timeBeginPeriod(periodMs) == TIMERR_NOERROR)
-        g_winmmPeriodActive = true;
-
-    // Register this thread with the Multimedia Class Scheduler Service as
-    // doing latency-sensitive work. This is the officially sanctioned way
-    // for a real-time-ish process to tell the scheduler "treat my timing
-    // requests as important" - the same category real-time audio/capture
-    // tools (which is the kind of tool DPC Latency Checker is) register
-    // under, and Microsoft's own docs note MMCSS scheduling decisions can
-    // depend on factors like foreground status.
-    DWORD taskIndex = 0;
-    g_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex);
-
-    return true;
-}
-
-static void ReleaseTimerResolution()
-{
-    if (g_mmcssHandle)
-    {
-        AvRevertMmThreadCharacteristics(g_mmcssHandle);
-        g_mmcssHandle = nullptr;
-    }
-    if (g_winmmPeriodActive)
-    {
-        UINT periodMs = (UINT)(g_appliedResolution / 10000);
-        if (periodMs < 1) periodMs = 1;
-        timeEndPeriod(periodMs);
-        g_winmmPeriodActive = false;
-    }
-    if (!g_resolutionActive || !pNtSetTimerResolution)
+    if (!menu)
         return;
-    ULONG achieved = 0;
-    pNtSetTimerResolution(g_appliedResolution, FALSE, &achieved);
-    g_resolutionActive = false;
+
+    bool enabled =
+        InterlockedCompareExchange(
+            &g_enabled,
+            1,
+            1
+        ) != 0;
+
+    AppendMenuW(
+        menu,
+        MF_STRING | (enabled ? MF_CHECKED : 0),
+        ID_ENABLE,
+        L"Timer fix attivo"
+    );
+
+    AppendMenuW(
+        menu,
+        MF_SEPARATOR,
+        0,
+        nullptr
+    );
+
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_EXIT,
+        L"Esci"
+    );
+
+    POINT pt{};
+    GetCursorPos(&pt);
+
+    // Necessario per far funzionare correttamente il menu
+    // della tray quando viene aperto con il mouse.
+    SetForegroundWindow(hwnd);
+
+    TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON |
+        TPM_BOTTOMALIGN |
+        TPM_LEFTALIGN,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        nullptr
+    );
+
+    PostMessageW(
+        hwnd,
+        WM_NULL,
+        0,
+        0
+    );
+
+    DestroyMenu(menu);
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+// ------------------------------------------------------------
+// Window procedure
+// ------------------------------------------------------------
+
+static LRESULT CALLBACK WndProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam)
 {
     switch (msg)
     {
-    case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP)
+        case WM_TRAYICON:
         {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
-            SetForegroundWindow(hwnd); // required so the menu closes properly
-            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-            DestroyMenu(menu);
-        }
-        return 0;
+            if (lParam == WM_RBUTTONUP)
+            {
+                ShowTrayMenu(hwnd);
+            }
+            else if (lParam == WM_LBUTTONDBLCLK)
+            {
+                bool enabled =
+                    InterlockedCompareExchange(
+                        &g_enabled,
+                        1,
+                        1
+                    ) != 0;
 
-    case WM_COMMAND:
-        if (LOWORD(wParam) == ID_TRAY_EXIT)
+                InterlockedExchange(
+                    &g_enabled,
+                    enabled ? 0 : 1
+                );
+
+                UpdateTrayTooltip();
+            }
+
+            return 0;
+        }
+
+        case WM_COMMAND:
         {
-            DestroyWindow(hwnd);
-        }
-        return 0;
+            switch (LOWORD(wParam))
+            {
+                case ID_ENABLE:
+                {
+                    bool enabled =
+                        InterlockedCompareExchange(
+                            &g_enabled,
+                            1,
+                            1
+                        ) != 0;
 
-    case WM_DESTROY:
-        ReleaseTimerResolution();
-        RemoveTrayIcon();
-        PostQuitMessage(0);
-        return 0;
+                    InterlockedExchange(
+                        &g_enabled,
+                        enabled ? 0 : 1
+                    );
+
+                    UpdateTrayTooltip();
+
+                    return 0;
+                }
+
+                case ID_EXIT:
+                {
+                    InterlockedExchange(
+                        &g_running,
+                        0
+                    );
+
+                    PostQuitMessage(0);
+
+                    return 0;
+                }
+            }
+
+            break;
+        }
+
+        case WM_DESTROY:
+        {
+            InterlockedExchange(
+                &g_running,
+                0
+            );
+
+            PostQuitMessage(0);
+
+            return 0;
+        }
     }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+
+    return DefWindowProcW(
+        hwnd,
+        msg,
+        wParam,
+        lParam
+    );
 }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
-{
-    // Single instance only.
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS)
-        return 0;
+// ------------------------------------------------------------
+// WinMain
+// ------------------------------------------------------------
 
-    // Resolve the undocumented ntdll entry points.
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll)
+int WINAPI wWinMain(
+    HINSTANCE hInstance,
+    HINSTANCE,
+    PWSTR,
+    int)
+{
+    // --------------------------------------------------------
+    // Classe finestra nascosta
+    // --------------------------------------------------------
+
+    const wchar_t CLASS_NAME[] =
+        L"TimerFixHiddenWindow";
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = hInstance;
+    wc.lpfnWndProc = WndProc;
+    wc.lpszClassName = CLASS_NAME;
+
+    wc.hIcon = LoadIconW(
+        nullptr,
+        IDI_APPLICATION
+    );
+
+    wc.hCursor = LoadCursorW(
+        nullptr,
+        IDC_ARROW
+    );
+
+    if (!RegisterClassExW(&wc))
+        return 1;
+
+    g_icon = LoadIconW(
+        nullptr,
+        IDI_APPLICATION
+    );
+
+    // --------------------------------------------------------
+    // Finestra completamente nascosta
+    // --------------------------------------------------------
+
+    g_hwnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        L"TimerFix",
+        WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        0,
+        0,
+        nullptr,
+        nullptr,
+        hInstance,
+        nullptr
+    );
+
+    if (!g_hwnd)
+        return 1;
+
+    // --------------------------------------------------------
+    // Timer resolution
+    // --------------------------------------------------------
+
+    bool timerResolutionOK =
+        EnableTimerResolution();
+
+    // Anche se timeBeginPeriod fallisce,
+    // proviamo comunque il timer ad alta risoluzione.
+    (void)timerResolutionOK;
+
+    // --------------------------------------------------------
+    // Waitable timer
+    // --------------------------------------------------------
+
+    if (!CreateHighResolutionTimer())
     {
-        pNtSetTimerResolution = (NtSetTimerResolution_t)GetProcAddress(ntdll, "NtSetTimerResolution");
-        pNtQueryTimerResolution = (NtQueryTimerResolution_t)GetProcAddress(ntdll, "NtQueryTimerResolution");
+        DisableTimerResolution();
+        DestroyWindow(g_hwnd);
+        return 1;
     }
 
-    bool ok = ApplyFinestTimerResolution();
+    // --------------------------------------------------------
+    // Thread
+    // --------------------------------------------------------
 
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = kWindowClass;
-    RegisterClassExW(&wc);
+    g_thread = CreateThread(
+        nullptr,
+        0,
+        TimerThread,
+        nullptr,
+        0,
+        nullptr
+    );
 
-    // A real (not message-only) top-level window, kept out of the taskbar
-    // and alt-tab via WS_EX_TOOLWINDOW and never shown. Some of Windows'
-    // undocumented scheduling heuristics for timer-resolution propagation
-    // appear sensitive to whether the requesting process is a genuine
-    // window-owning application versus a pure background/message-only
-    // process, so we use a real window here rather than HWND_MESSAGE.
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kWindowClass, L"TimerFix",
-                                 WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
+    if (!g_thread)
+    {
+        CloseHandle(g_timer);
+        g_timer = nullptr;
 
-    AddTrayIcon(hwnd, ok);
+        DisableTimerResolution();
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+        DestroyWindow(g_hwnd);
+
+        return 1;
+    }
+
+    // --------------------------------------------------------
+    // Tray
+    // --------------------------------------------------------
+
+    AddTrayIcon(g_hwnd);
+
+    // --------------------------------------------------------
+    // Message loop
+    // --------------------------------------------------------
+
+    MSG msg{};
+
+    while (GetMessageW(
+        &msg,
+        nullptr,
+        0,
+        0) > 0)
     {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
-    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
-    return (int)msg.wParam;
+    // --------------------------------------------------------
+    // Shutdown
+    // --------------------------------------------------------
+
+    InterlockedExchange(
+        &g_running,
+        0
+    );
+
+    if (g_timer)
+    {
+        CancelWaitableTimer(g_timer);
+
+        // Sblocca eventualmente il thread.
+        SetEvent(g_timer);
+    }
+
+    if (g_thread)
+    {
+        WaitForSingleObject(
+            g_thread,
+            2000
+        );
+
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+
+    if (g_timer)
+    {
+        CloseHandle(g_timer);
+        g_timer = nullptr;
+    }
+
+    RemoveTrayIcon();
+
+    DisableTimerResolution();
+
+    return 0;
 }
