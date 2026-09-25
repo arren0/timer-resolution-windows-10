@@ -1,315 +1,395 @@
 // timerfix.cpp
-// Windows 10 - minimal tray utility
+// Windows 10 - DPC Latency Checker driver activator
 //
-// IMPORTANT:
-// This version does NOT pretend to reproduce the undocumented driver IOCTL.
-// It is a corrected, standalone tray program that remains running even when
-// the DPC driver is unavailable. It uses a high-resolution waitable timer
-// where supported and falls back cleanly.
+// This version reproduces the user-mode portion visible in the supplied
+// API Monitor capture:
+//
+//   OpenSCManagerA
+//   CreateServiceA / StartServiceA for "dpclat_driver"
+//   CreateFileA("\\\\.\\dpclat_static_device")
+//   DeviceIoControl(IOCTL 0x81772010, 20-byte buffer)
+//
+// It intentionally does NOT call timeBeginPeriod/timeSetEvent/Sleep as the
+// fix. The observed effect is associated with the kernel driver remaining
+// active.
+//
+// The existing dpclat_driver.sys is preferred. If the service does not exist,
+// the program looks for dpclat_driver.sys beside TimerFix.exe or in
+// %SystemRoot%\\System32\\drivers.
 //
 // Build:
-// cl /O2 /Os /EHsc /DUNICODE /D_UNICODE timerfix.cpp /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib winmm.lib
+//   cl /O2 /Os /EHsc /DUNICODE /D_UNICODE timerfix.cpp /link /SUBSYSTEM:WINDOWS
+//      user32.lib shell32.lib advapi32.lib /OUT:TimerFix.exe
+//
+// Run elevated because creating/starting a kernel service requires admin.
+// The tray icon is created before driver setup so failures are visible.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
 #include <windows.h>
 #include <shellapi.h>
-#include <mmsystem.h>
+#include <winsvc.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "advapi32.lib")
 
-namespace
+namespace {
+
+constexpr wchar_t kServiceName[] = L"dpclat_driver";
+constexpr wchar_t kDeviceName[]  = L"\\\\.\\dpclat_static_device";
+constexpr DWORD   kIoctl        = 0x81772010u;
+
+constexpr UINT WM_TRAY = WM_APP + 1;
+constexpr UINT ID_EXIT = 1001;
+
+HWND   g_hwnd = nullptr;
+HANDLE g_stop = nullptr;
+HANDLE g_worker = nullptr;
+HANDLE g_device = INVALID_HANDLE_VALUE;
+SC_HANDLE g_scm = nullptr;
+SC_HANDLE g_service = nullptr;
+
+bool g_serviceCreatedByUs = false;
+bool g_serviceWasRunning = false;
+
+NOTIFYICONDATAW g_nid{};
+
+bool GetExeDir(wchar_t* out, DWORD cch)
 {
-    constexpr UINT WM_TRAYICON = WM_APP + 1;
-    constexpr UINT ID_EXIT = 1;
+    DWORD n = GetModuleFileNameW(nullptr, out, cch);
+    if (!n || n >= cch)
+        return false;
 
-    HWND   g_hwnd = nullptr;
-    HANDLE g_stop = nullptr;
-    HANDLE g_worker = nullptr;
-    HANDLE g_timer = nullptr;
+    while (n && out[n - 1] != L'\\')
+        --n;
 
-    NOTIFYICONDATAW g_tray{};
+    if (!n)
+        return false;
 
-    // ------------------------------------------------------------
-    // High-resolution timer
-    // ------------------------------------------------------------
+    out[n - 1] = L'\0';
+    return true;
+}
 
-    using CreateWaitableTimerExWFn =
-        HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES,
-                          LPCWSTR,
-                          DWORD,
-                          DWORD);
+bool FileExists(const wchar_t* path)
+{
+    DWORD a = GetFileAttributesW(path);
+    return a != INVALID_FILE_ATTRIBUTES &&
+           !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
 
-    constexpr DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_LOCAL = 0x00000002;
-
-    HANDLE CreateHighResTimer()
-    {
-        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-
-        if (!kernel32)
-            return nullptr;
-
-        auto fn =
-            reinterpret_cast<CreateWaitableTimerExWFn>(
-                GetProcAddress(
-                    kernel32,
-                    "CreateWaitableTimerExW"));
-
-        if (!fn)
-            return nullptr;
-
-        HANDLE timer = fn(
-            nullptr,
-            nullptr,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION_LOCAL,
-            TIMER_ALL_ACCESS
-        );
-
-        return timer;
+bool FindDriverPath(wchar_t* out, DWORD cch)
+{
+    wchar_t exeDir[MAX_PATH]{};
+    if (GetExeDir(exeDir, ARRAYSIZE(exeDir))) {
+        if (swprintf_s(out, cch, L"%s\\dpclat_driver.sys", exeDir) > 0 &&
+            FileExists(out))
+            return true;
     }
 
-    DWORD WINAPI Worker(LPVOID)
-    {
-        // Request the normal 1 ms system timer period.
-        // This is only a scheduler hint; it is NOT presented as a
-        // guarantee that Sleep(1) lasts 1 ms.
-        timeBeginPeriod(1);
+    wchar_t sys[MAX_PATH]{};
+    UINT n = GetSystemDirectoryW(sys, ARRAYSIZE(sys));
+    if (!n || n >= ARRAYSIZE(sys))
+        return false;
 
-        g_timer = CreateHighResTimer();
+    if (swprintf_s(out, cch, L"%s\\drivers\\dpclat_driver.sys", sys) <= 0)
+        return false;
 
-        if (g_timer)
-        {
-            LARGE_INTEGER due{};
-            due.QuadPart = -10000LL; // 1 ms relative
+    return FileExists(out);
+}
 
-            HANDLE handles[2] =
-            {
-                g_stop,
-                g_timer
-            };
+bool OpenServiceManager()
+{
+    g_scm = OpenSCManagerW(
+        nullptr,
+        nullptr,
+        SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
 
-            while (true)
-            {
-                if (WaitForSingleObject(
-                        g_stop,
-                        0) == WAIT_OBJECT_0)
-                    break;
+    return g_scm != nullptr;
+}
 
-                if (!SetWaitableTimer(
-                        g_timer,
-                        &due,
-                        0,
-                        nullptr,
-                        nullptr,
-                        FALSE))
-                {
-                    break;
-                }
+bool OpenOrCreateDriverService()
+{
+    g_service = OpenServiceW(
+        g_scm,
+        kServiceName,
+        SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_STOP);
 
-                DWORD result = WaitForMultipleObjects(
-                    2,
-                    handles,
-                    FALSE,
-                    INFINITE
-                );
+    if (g_service)
+        return true;
 
-                if (result == WAIT_OBJECT_0)
-                    break;
+    if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
+        return false;
 
-                if (result != WAIT_OBJECT_0 + 1)
-                    break;
-            }
+    wchar_t driverPath[MAX_PATH]{};
+    if (!FindDriverPath(driverPath, ARRAYSIZE(driverPath)))
+        return false;
 
-            CancelWaitableTimer(g_timer);
-            CloseHandle(g_timer);
-            g_timer = nullptr;
+    g_service = CreateServiceW(
+        g_scm,
+        kServiceName,
+        kServiceName,
+        SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_STOP,
+        SERVICE_KERNEL_DRIVER,
+        SERVICE_DEMAND_START,
+        SERVICE_ERROR_NORMAL,
+        driverPath,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    if (!g_service)
+        return false;
+
+    g_serviceCreatedByUs = true;
+    return true;
+}
+
+bool QueryServiceRunning(bool& running)
+{
+    SERVICE_STATUS_PROCESS s{};
+    DWORD bytes = 0;
+
+    if (!QueryServiceStatusEx(
+            g_service,
+            SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&s),
+            sizeof(s),
+            &bytes))
+        return false;
+
+    running = (s.dwCurrentState == SERVICE_RUNNING);
+    return true;
+}
+
+bool StartDriver()
+{
+    bool running = false;
+    if (!QueryServiceRunning(running))
+        return false;
+
+    if (running) {
+        g_serviceWasRunning = true;
+        return true;
+    }
+
+    if (!StartServiceW(g_service, 0, nullptr)) {
+        DWORD e = GetLastError();
+        if (e != ERROR_SERVICE_ALREADY_RUNNING)
+            return false;
+    }
+
+    for (int i = 0; i < 100; ++i) {
+        Sleep(10);
+
+        if (!QueryServiceRunning(running))
+            return false;
+
+        if (running)
+            return true;
+    }
+
+    return false;
+}
+
+bool OpenDevice()
+{
+    g_device = CreateFileW(
+        kDeviceName,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    return g_device != INVALID_HANDLE_VALUE;
+}
+
+bool SendObservedIoctl()
+{
+    if (g_device == INVALID_HANDLE_VALUE)
+        return false;
+
+    // This is the 20-byte input buffer observed in the supplied APMX trace.
+    // It is passed as both input and output by dpclat.exe.
+    DWORD data[5] = {
+        0xFFFFFFFFu,
+        0x00000000u,
+        0x0000012Cu, // 300
+        0x00000113u, // 275
+        0x00000001u
+    };
+
+    DWORD returned = 0;
+
+    return DeviceIoControl(
+        g_device,
+        kIoctl,
+        data,
+        sizeof(data),
+        data,
+        sizeof(data),
+        &returned,
+        nullptr) != FALSE;
+}
+
+DWORD WINAPI Worker(LPVOID)
+{
+    // The original application sends this request approximately once per
+    // second while the driver/device stays open.
+    SendObservedIoctl();
+
+    while (WaitForSingleObject(g_stop, 1000) == WAIT_TIMEOUT)
+        SendObservedIoctl();
+
+    return 0;
+}
+
+bool AddTrayIcon(HWND hwnd)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+
+    g_nid.hIcon = LoadIconW(
+        nullptr,
+        MAKEINTRESOURCEW(IDI_APPLICATION));
+
+    lstrcpynW(
+        g_nid.szTip,
+        L"TimerFix",
+        ARRAYSIZE(g_nid.szTip));
+
+    return Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE;
+}
+
+void RemoveTrayIcon()
+{
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+void ShowTrayMenu(HWND hwnd)
+{
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+
+    AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
+
+    POINT p{};
+    GetCursorPos(&p);
+    SetForegroundWindow(hwnd);
+
+    TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+        p.x, p.y, 0, hwnd, nullptr);
+
+    DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+}
+
+void Cleanup()
+{
+    if (g_stop)
+        SetEvent(g_stop);
+
+    if (g_worker) {
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker);
+        g_worker = nullptr;
+    }
+
+    if (g_device != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_device);
+        g_device = INVALID_HANDLE_VALUE;
+    }
+
+    // IMPORTANT:
+    // Do not stop a pre-existing dpclat driver on Exit. DPC Latency
+    // Checker's effect comes from the kernel driver being active.
+    //
+    // If we created the service only because it was absent, leave it
+    // installed/running just like the normal DPC Latency Checker session.
+    //
+    // This also avoids tearing down the kernel component while another
+    // process may still be using it.
+
+    if (g_service) {
+        CloseServiceHandle(g_service);
+        g_service = nullptr;
+    }
+
+    if (g_scm) {
+        CloseServiceHandle(g_scm);
+        g_scm = nullptr;
+    }
+}
+
+LRESULT CALLBACK WndProc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    switch (msg) {
+    case WM_TRAY:
+        if (lParam == WM_RBUTTONUP ||
+            lParam == WM_CONTEXTMENU)
+            ShowTrayMenu(hwnd);
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_EXIT) {
+            DestroyWindow(hwnd);
+            return 0;
         }
-        else
-        {
-            // Compatibility fallback. The process still remains alive
-            // and tray-visible; no busy loop is used.
-            while (WaitForSingleObject(
-                       g_stop,
-                       1000) == WAIT_TIMEOUT)
-            {
-            }
-        }
+        return 0;
 
-        timeEndPeriod(1);
+    case WM_DESTROY:
+        Cleanup();
+        RemoveTrayIcon();
+        PostQuitMessage(0);
         return 0;
     }
 
-    // ------------------------------------------------------------
-    // Tray
-    // ------------------------------------------------------------
-
-    bool AddTray(HWND hwnd)
-    {
-        ZeroMemory(&g_tray, sizeof(g_tray));
-
-        g_tray.cbSize = sizeof(g_tray);
-        g_tray.hWnd = hwnd;
-        g_tray.uID = 1;
-        g_tray.uFlags =
-            NIF_MESSAGE |
-            NIF_ICON |
-            NIF_TIP;
-
-        g_tray.uCallbackMessage = WM_TRAYICON;
-
-        g_tray.hIcon = LoadIconW(
-            nullptr,
-            MAKEINTRESOURCEW(IDI_APPLICATION)
-        );
-
-        lstrcpynW(
-            g_tray.szTip,
-            L"TimerFix",
-            ARRAYSIZE(g_tray.szTip)
-        );
-
-        return Shell_NotifyIconW(
-            NIM_ADD,
-            &g_tray
-        ) != FALSE;
-    }
-
-    void RemoveTray()
-    {
-        Shell_NotifyIconW(
-            NIM_DELETE,
-            &g_tray
-        );
-    }
-
-    void ShowMenu(HWND hwnd)
-    {
-        HMENU menu = CreatePopupMenu();
-
-        if (!menu)
-            return;
-
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            ID_EXIT,
-            L"Exit"
-        );
-
-        POINT pt{};
-        GetCursorPos(&pt);
-
-        SetForegroundWindow(hwnd);
-
-        TrackPopupMenu(
-            menu,
-            TPM_RIGHTBUTTON |
-            TPM_BOTTOMALIGN |
-            TPM_LEFTALIGN,
-            pt.x,
-            pt.y,
-            0,
-            hwnd,
-            nullptr
-        );
-
-        DestroyMenu(menu);
-
-        PostMessageW(hwnd, WM_NULL, 0, 0);
-    }
-
-    // ------------------------------------------------------------
-    // Hidden message window
-    // ------------------------------------------------------------
-
-    LRESULT CALLBACK WndProc(
-        HWND hwnd,
-        UINT msg,
-        WPARAM wParam,
-        LPARAM lParam)
-    {
-        switch (msg)
-        {
-        case WM_TRAYICON:
-
-            if (lParam == WM_RBUTTONUP ||
-                lParam == WM_CONTEXTMENU)
-            {
-                ShowMenu(hwnd);
-            }
-
-            return 0;
-
-        case WM_COMMAND:
-
-            if (LOWORD(wParam) == ID_EXIT)
-            {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-
-            return 0;
-
-        case WM_DESTROY:
-
-            if (g_stop)
-                SetEvent(g_stop);
-
-            if (g_worker)
-            {
-                WaitForSingleObject(
-                    g_worker,
-                    INFINITE
-                );
-
-                CloseHandle(g_worker);
-                g_worker = nullptr;
-            }
-
-            RemoveTray();
-
-            PostQuitMessage(0);
-            return 0;
-        }
-
-        return DefWindowProcW(
-            hwnd,
-            msg,
-            wParam,
-            lParam
-        );
-    }
-
-    HWND CreateHiddenWindow(HINSTANCE instance)
-    {
-        constexpr wchar_t CLASS_NAME[] =
-            L"TimerFix_Tray_Window";
-
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = WndProc;
-        wc.hInstance = instance;
-        wc.lpszClassName = CLASS_NAME;
-
-        if (!RegisterClassExW(&wc))
-            return nullptr;
-
-        return CreateWindowExW(
-            0,
-            CLASS_NAME,
-            L"TimerFix",
-            0,
-            0, 0, 0, 0,
-            HWND_MESSAGE,
-            nullptr,
-            instance,
-            nullptr
-        );
-    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
+
+HWND CreateHiddenWindow(HINSTANCE hInstance)
+{
+    constexpr wchar_t kClass[] = L"TimerFix_DPC_Tray";
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = hInstance;
+    wc.lpfnWndProc = WndProc;
+    wc.lpszClassName = kClass;
+
+    if (!RegisterClassExW(&wc))
+        return nullptr;
+
+    return CreateWindowExW(
+        0,
+        kClass,
+        L"TimerFix",
+        0,
+        0, 0, 0, 0,
+        HWND_MESSAGE,
+        nullptr,
+        hInstance,
+        nullptr);
+}
+
+} // namespace
 
 int WINAPI wWinMain(
     HINSTANCE hInstance,
@@ -320,82 +400,74 @@ int WINAPI wWinMain(
     HANDLE mutex = CreateMutexW(
         nullptr,
         TRUE,
-        L"Global\\TimerFix_Unique"
-    );
+        L"Global\\TimerFix_DPC_Driver");
 
     if (!mutex)
         return 1;
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-    {
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(mutex);
         return 0;
     }
 
-    // Create the tray FIRST.
-    // Therefore a failure in any timer mechanism cannot make
-    // the program silently disappear before the tray icon exists.
+    // Tray exists independently of driver setup.
     g_stop = CreateEventW(
         nullptr,
         TRUE,
         FALSE,
-        nullptr
-    );
+        nullptr);
 
-    if (!g_stop)
-    {
+    if (!g_stop) {
         CloseHandle(mutex);
         return 1;
     }
 
     g_hwnd = CreateHiddenWindow(hInstance);
-
-    if (!g_hwnd)
-    {
+    if (!g_hwnd) {
         CloseHandle(g_stop);
         CloseHandle(mutex);
         return 1;
     }
 
-    if (!AddTray(g_hwnd))
-    {
+    if (!AddTrayIcon(g_hwnd)) {
         DestroyWindow(g_hwnd);
         CloseHandle(g_stop);
         CloseHandle(mutex);
         return 1;
     }
 
-    g_worker = CreateThread(
-        nullptr,
-        0,
-        Worker,
-        nullptr,
-        0,
-        nullptr
-    );
+    // Driver setup.
+    bool ok =
+        OpenServiceManager() &&
+        OpenOrCreateDriverService() &&
+        StartDriver() &&
+        OpenDevice();
 
-    // If the worker cannot start, the tray still works.
-    // Exit remains available and the program does not vanish.
+    if (ok)
+        SendObservedIoctl();
+
+    // Keep the process/tray alive even if driver setup failed.
+    // The icon is therefore always visible and Exit always works.
+    if (ok) {
+        g_worker = CreateThread(
+            nullptr,
+            0,
+            Worker,
+            nullptr,
+            0,
+            nullptr);
+    }
+
     MSG msg{};
-
-    while (GetMessageW(
-        &msg,
-        nullptr,
-        0,
-        0) > 0)
-    {
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    if (g_worker)
-    {
-        WaitForSingleObject(
-            g_worker,
-            INFINITE
-        );
-
+    if (g_worker) {
+        WaitForSingleObject(g_worker, INFINITE);
         CloseHandle(g_worker);
+        g_worker = nullptr;
     }
 
     CloseHandle(g_stop);
